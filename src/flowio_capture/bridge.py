@@ -11,6 +11,7 @@ from Python, or by POSTing JSON to ``server.py`` from any language).
     single cell edited in comp editor   -> on_cell_changed
     matrix changed (no cell detail)     -> on_matrix_changed
     bivariate plot / NxN cell focused   -> on_view_changed
+    plot redrawn (sample or control)    -> on_plot_observed (needs capture_plots=True)
     control re-gated / stats changed    -> on_controls_updated
     undo / redo in comp editor          -> on_undo / on_redo  (send matrix_after!)
     export, report, or batch analysis   -> on_export   (acceptance signal)
@@ -29,13 +30,15 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from collections import OrderedDict
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from . import fcs
 from .normalize import MatrixConvention
+from .plots import PlotSummary
 from .privacy import Pseudonymizer, keyed_file_token, regular_file, sanitize, scrub_keywords
-from .recorder import DEFAULT_MATRIX, CaptureSession
+from .recorder import DEFAULT_MATRIX, DEFAULT_PLOT_BUDGET, CaptureSession
 from .schema import ControlStats, Matrix, SchemaError, SessionContext
 from .store import Store
 
@@ -52,11 +55,20 @@ SAFE_VIEW_KEYS = {"x", "y", "population", "plot_type", "transform"}
 
 class FlowIoBridge:
     def __init__(self, root: os.PathLike, pseudo: Optional[Pseudonymizer] = None,
-                 app_version: Optional[str] = None, convention: Optional[MatrixConvention] = None):
+                 app_version: Optional[str] = None, convention: Optional[MatrixConvention] = None,
+                 clock: Callable[[], float] = time.time, capture_plots: bool = False,
+                 plot_budget_bytes: int = DEFAULT_PLOT_BUDGET):
+        """``capture_plots`` is off by default: plot histograms are aggregate
+        but derived from sample data, so enable it only after the lab's
+        privacy review. ``clock`` lets a queueing façade stamp events with
+        the time they happened rather than the time they were applied."""
         self.store = Store(root)
         self.pseudo = pseudo or Pseudonymizer.load(root)
         self.app_version = app_version
         self.default_convention = convention
+        self.clock = clock
+        self.capture_plots = capture_plots
+        self.plot_budget_bytes = plot_budget_bytes
         self._sessions: Dict[str, CaptureSession] = {}
         self._conventions: Dict[str, MatrixConvention] = {}
         self._seen_ids: "OrderedDict[Tuple[str, str], None]" = OrderedDict()
@@ -111,7 +123,8 @@ class FlowIoBridge:
                 acq_canon = MatrixConvention(primary=conv.primary).to_canonical(acq)
             except SchemaError:
                 acq_canon = None
-        sess = CaptureSession.start(self.store, ctx)  # validates ctx before touching old session
+        sess = CaptureSession.start(self.store, ctx, clock=self.clock,  # validates ctx before touching old session
+                                    plot_budget_bytes=self.plot_budget_bytes)
         with self._lock:
             old = self._sessions.pop(key, None)
             self._sessions[key] = sess
@@ -173,12 +186,37 @@ class FlowIoBridge:
 
     def on_view_changed(self, workspace_ref: str, x: Optional[str], y: Optional[str],
                         population: Optional[str] = None, **extra: Any) -> None:
+        """``plot=`` may carry a PlotSummary dict of what is now on screen."""
         sess, _ = self._get(workspace_ref)
+        plot = extra.pop("plot", None)
         safe = {k: v for k, v in extra.items() if k in SAFE_VIEW_KEYS and not isinstance(v, (dict, list))}
         other = {k: v for k, v in extra.items() if k not in safe}
         if other:
             safe["extra"] = sanitize(other, self.pseudo, "view")
         sess.set_view(x, y, population, **safe)
+        if plot is not None and self.capture_plots:
+            self.on_plot_observed(workspace_ref, plot=plot)
+
+    def on_plot_observed(self, workspace_ref: str, plot: Any = None, x: Optional[str] = None,
+                         y: Optional[str] = None, xs: Any = None, ys: Any = None, bins: int = 64,
+                         matrix_id: str = DEFAULT_MATRIX, **fields: Any) -> Any:
+        """The plot on screen was (re)drawn. Pass either a ready ``plot``
+        summary dict, or raw event coordinates ``xs``/``ys`` for detectors
+        ``x``/``y`` to be binned here (``bins``, ``x_scale``, ``y_scale``,
+        ``kind``, ``population``, ``control_fluorochrome`` as fields).
+        Returns the plot's event seq, or None if dropped (budget)."""
+        sess, _ = self._get(workspace_ref)
+        if not self.capture_plots:
+            return {"ignored": "capture_plots is off"}
+        if plot is not None:
+            ps = plot if isinstance(plot, PlotSummary) else PlotSummary.from_dict(plot)
+        elif xs is not None and ys is not None and x and y:
+            ps = PlotSummary.from_events(x, y, xs, ys, bins=bins, **fields)
+        else:
+            raise SchemaError("pass plot={...} or x, y, xs, ys")
+        if ps.extra:
+            ps.extra = sanitize(ps.extra, self.pseudo, "plot")
+        return sess.observe_plot(ps, matrix_id=matrix_id)
 
     def on_controls_updated(self, workspace_ref: str, controls: Iterable[Dict[str, Any]]) -> None:
         sess, _ = self._get(workspace_ref)
@@ -203,8 +241,8 @@ class FlowIoBridge:
 
     # ---- generic dispatch (used by the HTTP server) -----------------------
     HANDLERS = ("on_workspace_opened", "on_workspace_closed", "on_compensation_loaded",
-                "on_cell_changed", "on_matrix_changed", "on_view_changed", "on_controls_updated",
-                "on_undo", "on_redo", "on_export")
+                "on_cell_changed", "on_matrix_changed", "on_view_changed", "on_plot_observed",
+                "on_controls_updated", "on_undo", "on_redo", "on_export")
     MAX_SEEN_IDS = 100_000
 
     def handle(self, event: Any) -> Any:

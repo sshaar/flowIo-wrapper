@@ -161,11 +161,12 @@ UNDO = "undo"
 REDO = "redo"
 EXPORT = "export"                # implicit acceptance signal
 CONTROLS_UPDATED = "controls_updated"  # control stats changed (re-gating)
+PLOT = "plot"                    # downsampled histogram of the plot on screen
 SESSION_ENDED = "session_ended"
 NOTE = "note"                    # free-form annotation
 
 EVENT_TYPES = {SESSION_STARTED, SNAPSHOT, CELL_EDIT, VIEW_CHANGED, UNDO, REDO,
-               EXPORT, CONTROLS_UPDATED, SESSION_ENDED, NOTE}
+               EXPORT, CONTROLS_UPDATED, PLOT, SESSION_ENDED, NOTE}
 
 # Snapshot sources. "acquisition" = FCS $SPILLOVER; "auto" = computed from
 # controls by the app; "manual" = state after user edits; "import" = loaded

@@ -36,11 +36,13 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import schema as S
+from .plots import PlotSummary
 from .schema import ControlStats, Matrix, SchemaError, SessionContext
 from .store import SessionWriter, Store
 
 DEFAULT_MATRIX = "default"
 JUDGMENT_ORIGINS = {"user", "undo", "redo"}
+DEFAULT_PLOT_BUDGET = 64 << 20  # bytes of plot JSON per session
 
 
 def _iso(ts: float) -> str:
@@ -64,7 +66,8 @@ class _MatrixState:
 
 
 class CaptureSession:
-    def __init__(self, writer: SessionWriter, clock: Callable[[], float] = time.time):
+    def __init__(self, writer: SessionWriter, clock: Callable[[], float] = time.time,
+                 plot_budget_bytes: int = DEFAULT_PLOT_BUDGET):
         self._w = writer
         self._clock = clock
         self._lock = threading.RLock()
@@ -73,11 +76,18 @@ class CaptureSession:
         self.view: Optional[Dict[str, Any]] = None
         self._ended = False
         self._last_edit_ts: Optional[float] = None
+        # Plots: latest plot seq per (x, y, kind), attached to subsequent edits.
+        self.plot_budget_bytes = plot_budget_bytes
+        self._plot_bytes = 0
+        self._plot_hashes: Dict[str, int] = {}
+        self._plots_for_view: Dict[Tuple[str, str], Dict[str, int]] = {}
+        self._plot_budget_noted = False
 
     # ---- lifecycle ---------------------------------------------------------
     @classmethod
     def start(cls, store: Store, context: SessionContext, session_id: Optional[str] = None,
-              clock: Callable[[], float] = time.time) -> "CaptureSession":
+              clock: Callable[[], float] = time.time,
+              plot_budget_bytes: int = DEFAULT_PLOT_BUDGET) -> "CaptureSession":
         sid = session_id or uuid.uuid4().hex
         path = store.path_for(sid)
         if path.exists():
@@ -85,7 +95,7 @@ class CaptureSession:
         ctx = context.to_dict()
         _check_finite(ctx, "context")
         writer = store.open_writer(sid)
-        sess = cls(writer, clock=clock)
+        sess = cls(writer, clock=clock, plot_budget_bytes=plot_budget_bytes)
         try:
             sess._emit(S.SESSION_STARTED, {"context": ctx})
         except Exception:
@@ -219,6 +229,43 @@ class CaptureSession:
             self.view = view
             self._emit(S.VIEW_CHANGED, dict(view))
 
+    def observe_plot(self, plot: PlotSummary, matrix_id: str = DEFAULT_MATRIX) -> Optional[int]:
+        """The host refreshed a plot. Returns the event seq, or None if dropped.
+
+        The plot is tagged with the hash of the matrix it was compensated
+        with, and its seq is attached (as ``plot_refs``) to every later edit
+        made while the same channel pair is on screen. Identical plots are
+        logged once; a per-session byte budget bounds the log size.
+        """
+        with self._lock:
+            self._check_open()
+            data = plot.to_dict()
+            data["matrix_id"] = matrix_id
+            data["matrix_hash"] = self._state(matrix_id)["matrix_hash"]
+            key = (plot.x, plot.y)
+            h = hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+            if h in self._plot_hashes:
+                seq = self._plot_hashes[h]
+                self._plots_for_view.setdefault(key, {})[plot.kind] = seq
+                return seq
+            size = len(json.dumps(data, separators=(",", ":")))
+            if self._plot_bytes + size > self.plot_budget_bytes:
+                if not self._plot_budget_noted:
+                    self._plot_budget_noted = True
+                    self._emit(S.NOTE, {"kind": "plot_budget_exhausted", "bytes": self._plot_bytes})
+                return None
+            self._plot_bytes += size
+            rec = self._emit(S.PLOT, data)
+            self._plot_hashes[h] = rec["seq"]
+            self._plots_for_view.setdefault(key, {})[plot.kind] = rec["seq"]
+            return rec["seq"]
+
+    def _plot_refs(self) -> Optional[Dict[str, int]]:
+        if not self.view or not self.view.get("x") or not self.view.get("y"):
+            return None
+        refs = self._plots_for_view.get((self.view["x"], self.view["y"]))
+        return dict(refs) if refs else None
+
     def update_controls(self, controls: List[ControlStats]) -> None:
         """Control statistics changed (e.g. the scientist re-gated a control)."""
         with self._lock:
@@ -315,6 +362,7 @@ class CaptureSession:
             self._emit(S.CELL_EDIT, {"matrix_id": matrix_id, "row": r, "col": c, "old": a, "new": b,
                                      "origin": origin, "batch": batch,
                                      "view": dict(self.view) if self.view else None,
+                                     "plot_refs": self._plot_refs(),
                                      "dt_since_last_edit": dt, "meta": meta or {},
                                      "desynced": st.desynced, "matrix_hash": h}, ts=now)
 
