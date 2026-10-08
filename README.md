@@ -99,6 +99,11 @@ inside the capture store so sharing the store never shares the key). File-conten
 keywords pass through an allowlist, and other free-form strings (`extra`, unknown instrument keys, view extras,
 unrecognized export kinds/labels) are tokenized. Get IRB / lab sign-off before collecting.
 
+## Docs
+
+- [docs/INSTALL.md](docs/INSTALL.md): installing the wrapper on a Mac, running the collector, what the Flow.Io plugin needs
+- [docs/TRAINING_PLAN.md](docs/TRAINING_PLAN.md): phased plan from analysis to a plot-conditioned model
+
 ## Dev
 
 ```bash
